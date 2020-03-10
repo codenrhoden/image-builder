@@ -15,9 +15,13 @@
 # limitations under the License.
 
 import argparse
-import hashlib
 import difflib
+import glob
+import hashlib
+import os
 from os.path import basename, dirname, join, splitext
+import shutil
+import tarfile
 
 from lxml import etree
 
@@ -39,6 +43,8 @@ class OVFCustomizer(object):
             '/ovf:Envelope/ovf:VirtualSystem/ovf:VirtualHardwareSection')[0]
         self.annoSection = self.xpath(
             '/ovf:Envelope/ovf:VirtualSystem/ovf:AnnotationSection')[0]
+        self.FileSection = self.xpath(
+            '/ovf:Envelope/ovf:References/ovf:File')[0]
 
     def parseOvfXml(self, ovfFilename):
         with open(ovfFilename, 'rb') as ovfFile:
@@ -67,14 +73,17 @@ class OVFCustomizer(object):
         with open(join(self.ovfDir, self.ovfFilename), 'w') as ovfFile:
             ovfFile.write(ovfString)
 
-    def commitManifest(self, ovfHash):
+    def commitManifest(self, ovfString):
         with open(join(self.ovfDir, self.mfFilename(self.ovfFilename)), 'r') as mfFile:
             lines = mfFile.readlines()
         with open(join(self.ovfDir, self.mfFilename(self.ovfFilename)), 'w') as mfFile:
             for line in lines:
-                if line.startswith('SHA256(%s)=' % self.ovfFilename):
+                if line.startswith('SHA1(%s)=' % self.ovfFilename):
+                    mfFile.write('SHA1(%s)= %s\n' %
+                                 (self.ovfFilename, self.sha1(ovfString)))
+                elif line.startswith('SHA256(%s)=' % self.ovfFilename):
                     mfFile.write('SHA256(%s)= %s\n' %
-                                 (self.ovfFilename, ovfHash))
+                                 (self.ovfFilename, self.sha256(ovfString)))
                 else:
                     mfFile.write(line)
 
@@ -82,8 +91,10 @@ class OVFCustomizer(object):
         ovfString = self.xmlToString(self.ovfXml)
         self.commitOvf(ovfString)
 
-        ovfHash = self.sha1(ovfString)
-        self.commitManifest(ovfHash)
+        self.commitManifest(ovfString)
+
+    def getDiskName(self):
+        return join(self.ovfDir, self.FileSection.get(self.nsName('ovf', 'href')))
 
     def setProductProperty(self, key, value, type='string',
                            userConfigurable=False, withComment=False):
@@ -119,8 +130,7 @@ class OVFCustomizer(object):
 
     def setVersion(self, version):
         self.xpath('ovf:Version', root=self.productSection)[0].text = version
-        self.xpath('ovf:FullVersion', root=self.productSection)[
-                   0].text = version
+        self.xpath('ovf:FullVersion', root=self.productSection)[0].text = version
 
     def setProduct(self, value):
         self.xpath('ovf:Product', root=self.productSection)[0].text = value
@@ -129,6 +139,12 @@ class OVFCustomizer(object):
     def xmlToString(cls, xml):
         return etree.tostring(xml, pretty_print=True, xml_declaration=True,
                               encoding='utf-8').decode('utf-8')
+
+    @classmethod
+    def sha1(cls, data):
+        hasher = hashlib.sha1()
+        hasher.update(data.encode('utf-8'))
+        return hasher.hexdigest()
 
     @classmethod
     def sha256(cls, data):
@@ -142,20 +158,87 @@ class OVFCustomizer(object):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Customize OVF')
+    parser = argparse.ArgumentParser(description='Customize OVF metadata')
 
-    parser.add_argument('ovf', help='OVF file')
+    parser.add_argument('ovf', help='path to OVA/OVF file.')
+
+    parser.add_argument(
+        '--create_ova', action='store_true',
+        help='When set, create OVA when done')
+    parser.add_argument(
+        '--diff', action='store_true', help='Print diff of metadata')
     parser.add_argument(
         '--dry', action='store_true', help='Do not write changes to file')
     parser.add_argument(
-        '--diff', action='store_true', help='Print diff of metadata')
+        '--set_annotation', help='String value to set as product annotation',
+         metavar='annotation')
+    parser.add_argument(
+        '--set_product', help='String value to set as product description',
+        metavar='product')
+    parser.add_argument(
+        '--set_version', help='String value to set as product version',
+        metavar='version')
+
+    # Add product property
 
     args = parser.parse_args()
 
-    customizer = OVFCustomizer(args.ovf)
+    isOVA = False
+    targetBaseDir = dirname(args.ovf)
+    targetName = splitext(basename(args.ovf))[0]
+    ovaExtractDir = join(targetBaseDir, '.image-builder')
+
+    # Determine if file is OVF or OVA
+    if tarfile.is_tarfile(args.ovf):
+        # if OVA, extract archive and get path to OVF
+        print("Path is a tar archive, treating as OVA")
+        isOVA = True
+        os.mkdir(ovaExtractDir)
+        with tarfile.open(args.ovf) as tar:
+            tar.extractall(path=ovaExtractDir)
+            print("Extracted OVA to %s" % ovaExtractDir)
+        customizer = OVFCustomizer(join(ovaExtractDir, '%s.ovf' % targetName))
+    else:
+        customizer = OVFCustomizer(args.ovf)
+
+    if args.set_annotation is not None:
+        customizer.setAnnotation(args.set_annotation)
+
+    if args.set_product is not None:
+        customizer.setProduct(args.set_product)
+
+    if args.set_version is not None:
+        customizer.setVersion(args.set_version)
+
+    # TODO: Handle product properties
 
     if args.diff:
         print(customizer.ovfDiff())
 
     if not args.dry:
         customizer.commit()
+
+    # Repackage into OVA if requested
+    if args.create_ova and not args.dry:
+        ovaName = args.ovf
+        in_files = []
+        if isOVA:
+            # assume all files are already there, since we extracted an existing
+            # OVA
+            in_files = glob.glob(join(ovaExtractDir, '*'))
+        else:
+            ovaName = join(targetBaseDir, '%s.ova' % targetName)
+            in_files = [args.ovf,
+                        customizer.getDiskName(),
+                        customizer.mfFilename(args.ovf)]
+        print("creating OVA %s" % ovaName)
+        with open(ovaName, 'wb') as f:
+            with tarfile.open(fileobj=f, mode='w|') as tar:
+                for path in in_files:
+                    print("adding %s to OVA" % path)
+                    tar.add(path, arcname=basename(path))
+
+    # Clean up OVA dir unless we are not repackaging
+    if isOVA and args.create_ova:
+        shutil.rmtree(ovaExtractDir)
+        print("removed directory %s" % ovaExtractDir)
