@@ -18,9 +18,12 @@ import argparse
 import difflib
 import glob
 import hashlib
+import io
+import json
 import os
 from os.path import basename, dirname, join, splitext
 import shutil
+import sys
 import tarfile
 
 from lxml import etree
@@ -170,16 +173,26 @@ if __name__ == '__main__':
     parser.add_argument(
         '--dry', action='store_true', help='Do not write changes to file')
     parser.add_argument(
-        '--set_annotation', help='String value to set as product annotation',
-         metavar='annotation')
+        '--pprop_comment', action='store_true',
+        help='Whether to additionally set the product property value as a text comment')
     parser.add_argument(
-        '--set_product', help='String value to set as product description',
-        metavar='product')
+        '--pprop_json', action='store_true', help='Product Property value is JSON')
     parser.add_argument(
-        '--set_version', help='String value to set as product version',
-        metavar='version')
-
-    # Add product property
+        '--pprop_key', metavar='key', help='Product Property key')
+    ppv_group = parser.add_mutually_exclusive_group()
+    ppv_group.add_argument(
+        '--pprop_val', metavar='value', help='Product Property value')
+    ppv_group.add_argument(
+        '--pprop_valfile', metavar='path', help='Product Property value from a file')
+    parser.add_argument(
+        '--set_annotation', metavar='annotation',
+        help='String value to set as product annotation')
+    parser.add_argument(
+        '--set_product', metavar='product',
+        help='String value to set as product description')
+    parser.add_argument(
+        '--set_version', metavar='version',
+        help='String value to set as product version')
 
     args = parser.parse_args()
 
@@ -210,7 +223,22 @@ if __name__ == '__main__':
     if args.set_version is not None:
         customizer.setVersion(args.set_version)
 
-    # TODO: Handle product properties
+    if args.pprop_key is not None:
+        pprop_val = None
+        if args.pprop_val is not None:
+            pprop_val = args.pprop_val
+        elif args.pprop_valfile is not None:
+            with io.open(args.pprop_valfile, 'r', encoding='utf-8') as f:
+                pprop_val = f.read()
+        else:
+            print("Product Propery key specified, but no value")
+            sys.exit(1)
+
+        if args.pprop_json:
+            pprop_val = json.dumps(json.loads(pprop_val))
+
+        customizer.setProductProperty(
+            args.pprop_key, pprop_val, withComment=args.pprop_comment)
 
     if args.diff:
         print(customizer.ovfDiff())
